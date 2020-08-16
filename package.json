@@ -1,0 +1,23 @@
+{
+  "name": "nclient-lib",
+  "version": "1.0.10",
+  "description": "Basic client library for communicating on cloud",
+  "main": "index.js",
+  "scripts": {
+    "build": "rm -f nclient-lib-*.tgz && npm pack && cp nclient-lib-*.tgz ../ncloud/public/lib/nclient-lib.tgz"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "files": [
+    "index.js",
+    "NodeClient.js",
+    "NodeClientUtil.js"
+  ],
+  "dependencies": {
+    "socket.io-client": "^2.3.0",
+    "socket.io-stream": "^0.9.1",
+    "tail-file": "^1.4.13",
+    "uuid": "^3.3.3"
+  }
+}
