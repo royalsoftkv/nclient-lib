@@ -398,12 +398,17 @@ const NodeClient = {
         };
     },
 
-    readConfig(moduleId, file) {
+    readConfig(moduleId, file, create) {
         let configFile = path.join(process.cwd(),'app','configs',moduleId, file)
         if(fs.existsSync(configFile)) {
             let content = fs.readFileSync(configFile)
             return JSON.parse(content)
         } else {
+            if(create) {
+                let folder = path.join(process.cwd(),'app','configs',moduleId)
+                fs.mkdirSync(folder, { recursive: true} )
+                fs.writeFileSync(configFile, JSON.stringify({}))
+            }
             return {}
         }
     },
