@@ -361,7 +361,7 @@ const NodeClient = {
     },
 
     sendStreamRequest(stream, method, deviceId, params, ack) {
-        let fccStream = ss.createStream();
+        let fccStream = ss.createStream({objectMode:true});
         fccStream.pipe(stream);
         stream.on('end', function() {
             fccStream.end()
@@ -507,7 +507,7 @@ const NodeClient = {
         async upgrade() {
             return await new Promise(resolve => {
                 let to = config.modules_config.system.version_check.remote_device;
-                let stream = ss.createStream();
+                let stream = ss.createStream({objectMode:true});
                 ss(NodeClient.socket).emit('streamMessage',stream,{from: NodeClient.deviceId, to: to, method: 'getModuleSource', payload: config.modules_config.system.version_check},(res)=>{
                     console.log(res);
                 });
