@@ -1,6 +1,6 @@
 {
   "name": "nclient-lib",
-  "version": "1.0.11",
+  "version": "1.0.12",
   "description": "Basic client library for communicating on cloud",
   "main": "index.js",
   "scripts": {

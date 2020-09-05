@@ -93,6 +93,7 @@ const NodeClient = {
     handler: null,
     modules: [],
     methods: {},
+    streamRegistry: {},
 
     start() {
         NodeClient.init();
@@ -368,6 +369,9 @@ const NodeClient = {
         stream.on('close', function() {
             fccStream.end()
         });
+        stream.on('unpipe', function() {
+            fccStream.end()
+        });
         ss(this.socket).emit('requestDeviceStream', fccStream, {from: NodeClient.deviceId, to:deviceId, method:method, params: params }, (res)=>{
             ack(res);
         });
@@ -387,6 +391,34 @@ const NodeClient = {
 
     registerDeviceMethod(method, fn) {
         this.methods[method]=fn
+    },
+
+    registerDeviceStreamMethod(method, onStart, onEnd) {
+        let fn = (stream, params, ack) => {
+            let fnStream = new require('stream').Readable({
+                read() {},
+                objectMode: true
+            })
+            fnStream.pipe(stream)
+            if(!this.streamRegistry[method]) {
+                this.streamRegistry[method] = {}
+            }
+            this.streamRegistry[method][stream.id]=fnStream
+            stream.on('unpipe',()=>{
+                onEnd(fnStream)
+                delete this.streamRegistry[method][stream.id]
+                fnStream.destroy()
+            });
+            return onStart(fnStream, params)
+        }
+        this.methods[method]=fn
+    },
+
+    updateDeviceStreamMethod(method, fn) {
+        let streams = this.streamRegistry[method]
+        for(let stream in streams) {
+            fn(stream)
+        }
     },
 
     readModuleInfo(mpjson) {
