@@ -286,6 +286,17 @@ const NodeClient = {
         }
     },
 
+    loadUtils() {
+        let utilFolder = path.join(process.cwd(),'app','utils')
+        if(fs.existsSync(utilFolder)) {
+            fs.readdir(utilFolder, (err, files) => {
+                files.forEach(file => {
+                    file = path.join(utilFolder, file)
+                    require(file);
+                })
+            })
+        }
+    },
 
     async asyncEmit(event, params) {
         return new Promise((resolve, reject) => {
