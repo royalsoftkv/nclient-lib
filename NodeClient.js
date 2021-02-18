@@ -1,89 +1,136 @@
 /**
- * NodeClient.js v1.0.6
+ * NodeClient.js v1.0.25
  */
 
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const fs = require("fs");
 const path = require("path");
-const uuidv4 = require('uuid/v4');
+const uuidv4 = require('uuid/v4')
+const Tail = require('tail-file')
 
 let configFilePath = process.cwd()+'/config.json';
-let config = {};
+let config = {
+    connect_secret: undefined
+};
 if(fs.existsSync(configFilePath)) {
     config = require(process.cwd()+'/config.json');
 }
 
 const ss = require('socket.io-stream');
 const pjson = require(process.cwd() + '/package.json');
-const Tail = require('tail-file');
+const SocketUtil = require("./SocketUtil")
 
-function checkAllowedSender(nodeFrom) {
-    return true;
-}
+/** override destroy method to stop stream propagation **/
+const IOStream = ss.IOStream
+IOStream.prototype.destroy = function() {
 
-function checkAllowedMessage(message) {
-    return true;
-}
-
-function procesMessage(Handler, msg, ack) {
-    let fn = NodeClient.commonHandler[msg.method];
-    if (typeof Handler !== 'undefined' && typeof fn === "undefined") {
-        console.log(`index = ${msg.method.indexOf('.')}`);
-        if(msg.method.indexOf('.')>0) {
-            let arr = msg.method.split(".");
-            fn = Handler[arr[0]][arr[1]];
-        } else {
-            fn = Handler[msg.method];
-        }
+    if (this.destroyed) {
+        return;
     }
-    if (typeof fn === "function") {
-        console.debug(`Executing function ${msg.method}`);
-        const isAsync = fn.constructor.name === "AsyncFunction";
-        console.log('isAsync',isAsync);
-        let res;
-        if(isAsync) {
-            new Promise(async function(resolve, reject) {
-                try {
-                    resolve(await fn(msg));
-                } catch (e) {
-                    reject({error:true, message:e.message});
-                }
-            }).then((fnRes) => {
-                res = fnRes;
 
-            }).catch((err) => {
-                res = err;
-            }).finally(() => {
-                if (typeof ack === 'function') {
-                    ack(res);
-                }
-            });
-        } else {
+    this.readable = this.writable = false;
+
+    if (this.socket) {
+        this.socket.cleanup(this.id);
+        this.socket = null;
+    }
+    this.emit('destroyed')
+    this.destroyed = true;
+};
+
+let onExecNodeStream = (stream, method, params, ack) => {
+    try {
+        console.log(`Received execNodeStream ${method}`)
+        let fn = findFunction(method)
+        if(typeof fn !== 'function') {
+            console.log(`Method ${method} not found`);
+            ack({error:{message:`Method ${method} not found`, code:'DEVICE_METHOD_NOT_FOUND'}});
+            return;
+        }
+        ack(fn(stream, params, ack));
+    } catch(e) {
+        let res = {error:{message:e.message, stack:e.stack, code:'DEVICE_METHOD_ERROR'}};
+        ack(res);
+    }
+}
+
+let getConnectionParams = (params = {}) => {
+    let secret
+    if(!params.secret) {
+        secret = config.connect_secret;
+    }
+    return {
+        secret: secret,
+        deviceId: NodeClient.deviceId,
+        processId: process.pid,
+        modules: config.modules || [],
+        version: nclientVersion()
+    }
+}
+
+let findFunction = (method) => {
+    let fn = NodeClient.commonHandler[method];
+    if(!fn) {
+        fn = NodeClient.handler && NodeClient.handler[method];
+    }
+    if(!fn) {
+        fn = NodeClient.methods[method];
+    }
+    if(!fn) {
+        fn = global[method];
+    }
+    return fn
+}
+
+let onExecNodeMethod = (method, params, ack) => {
+    console.log(`execNodeMethod method=${method} params=${params}`)
+    let fn = findFunction(method)
+    if(typeof fn !== 'function') {
+        console.log(`Method ${method} not found`);
+        if(typeof ack === 'function') {
+            ack({error:{message:`Method ${method} not found`,status:'DEVICE_METHOD_NOT_FOUND',stack:Error().stack}});
+        }
+        return;
+    }
+    const isAsync = fn.constructor.name === "AsyncFunction";
+    if(isAsync) {
+        new Promise(async function (resolve, reject) {
+            let res;
             try {
-                res = fn(msg);
+                console.log('Calling function: res = await fn(params);')
+                res = await fn(params);
             } catch (e) {
-                res = {error:true, message:e.message};
+                res = {error: {message: e.message, stack: e.stack, code: 'DEVICE_METHOD_ERROR'}};
             }
             if (typeof ack === 'function') {
-                ack(res);
+                // console.log("Resolve: resolve(ack(res))")
+                // console.log("res", res)
+                resolve(ack(res));
+            } else {
+                // console.log("Resolve: resolve(res)")
+                resolve(res);
+            }
+        }).then();
+    } else {
+        if(typeof ack === 'function') {
+            console.log('Calling function: fn.apply(this, [params, ack])')
+            fn.apply(this, [params, ack])
+        } else {
+            try {
+                console.log('Calling function: res = fn(params);')
+                fn(params);
+            } catch(e) {
+                console.log({error:{message:e.message, stack:e.stack, code:'DEVICE_METHOD_ERROR'}})
             }
         }
-    } else {
-        console.warn(`Not found function ${msg.method}`);
     }
 }
 
-function procesStreamMessage(Handler, stream, data) {
-    let fn = NodeClient.commonHandler[data.method];
-    if (typeof Handler !== 'undefined' && typeof fn === "undefined") {
-        fn = Handler[data.method];
-    }
-    if (typeof fn === "function") {
-        fn(stream, data);
-    } else {
-        console.warn(`Not found function for stream ${data.method}`);
-    }
+let nclientVersion = () => {
+    let pjson = require('./package.json')
+    return pjson.version
 }
+
 
 const NodeClient = {
 
@@ -94,6 +141,138 @@ const NodeClient = {
     modules: [],
     methods: {},
     streamRegistry: {},
+    mqtt: null,
+    onConnect: null,
+    socketEventHandlers: {},
+    commonHandler: {
+        async execCmd(cmd) {
+
+            let hookFn = NodeClient.hooks && NodeClient.hooks.beforeExecCmd;
+            if(typeof hookFn === 'function') {
+                cmd = hookFn(cmd);
+            }
+
+            //console.log(`Executing shell command: ${cmd}`);
+            return new Promise(function(resolve, reject) {
+                exec(cmd, (err, stdout, stderr) => {
+                    if (err) {
+                        // node couldn't execute the command
+                        console.log(JSON.stringify(err));
+                        //reject(err);
+                    }
+                    resolve({
+                        stdout:stdout,
+                        stderr:stderr
+                    });
+                });
+            });
+        },
+        restart() {
+            setTimeout(function () {
+                process.on("exit", function () {
+                    require("child_process").spawn(process.argv.shift(), process.argv, {
+                        cwd: process.cwd(),
+                        detached : true,
+                        stdio: "inherit"
+                    });
+                });
+                process.exit();
+            }, 1000);
+        },
+        stop() {
+            process.exit();
+        },
+        getDeviceVersion(params, cb) {
+            cb(pjson.version)
+        },
+        async getLatestVersion() {
+            return await new Promise(resolve => {
+
+                let to = config.modules_config.system.version_check.remote_device;
+                NodeClient.execNodeMethod(to, 'getDeviceLatestVersion', config.modules_config.system.version_check, data => {
+                    resolve(data);
+                })
+            });
+        },
+        async upgrade() {
+            return await new Promise(resolve => {
+                let to = config.modules_config.system.version_check.remote_device;
+                let stream = ss.createStream({objectMode:true});
+                ss(NodeClient.socket).emit('streamMessage',stream,{from: NodeClient.deviceId, to: to, method: 'getModuleSource', payload: config.modules_config.system.version_check},(res)=>{
+                    console.log(res);
+                });
+                stream.on('data',(data)=>{
+                    console.log(data);
+                });
+                stream.pipe(fs.createWriteStream('/tmp/stream.txt'));
+            });
+        },
+        readFile(params, cb) {
+            file=params.file
+            let content = fs.readFileSync(file,'utf8');
+            cb(content)
+        },
+        writeFile(params, cb) {
+            let file = params.file
+            let content = params.content
+            let res = fs.writeFileSync(file, content);
+            cb(res)
+        },
+        appendFile(params, cb) {
+            let  { file, line} = params
+            let res = fs.appendFileSync(file, line);
+            cb(res)
+        },
+        fileExists(file, cb) {
+            let res = fs.existsSync(file);
+            cb(res)
+        },
+        tailFile(stream, file, ack) {
+
+            let cmd = spawn('tail', ['-f', file]);
+            cmd.stdout.pipe(stream);
+
+            stream.on("destroyed", ()=>{
+                cmd.kill("SIGTERM")
+            })
+
+            ack(file)
+            // const mytail = new Tail(file);
+            // mytail.on('line', (line) => {
+            //     stream.write(line);
+            // });
+            // stream.on('end',()=>{
+            //     mytail.stop();
+            // });
+            // stream.on('unpipe',()=>{
+            //     mytail.stop();
+            // });
+            // mytail.start();
+            // if(ack) {
+            //     ack('OK');
+            // }
+        },
+        getClientModules(params, cb) {
+            cb(NodeClient.modules)
+        },
+        readConfig(params, cb) {
+            let  {module, file} = params
+            cb(NodeClient.readConfig(module, file))
+        },
+        storeConfig(params, cb) {
+            let  {module, file, content} = params
+            cb(NodeClient.storeConfig(module, file, content))
+        },
+        async updateNode() {
+            let res = await NodeClient.commonHandler.execCmd('npm update')
+            if(res.stderr) {
+                let res = await NodeClient.commonHandler.execCmd('./node ./npm update')
+                return res.stdout
+            } else {
+                return res.stdout
+            }
+        }
+    },
 
     start() {
         NodeClient.init();
@@ -102,45 +281,52 @@ const NodeClient = {
         NodeClient.loadModules();
     },
 
-    init() {
-        let deviceJsonFile = process.cwd() + "/device.json";
-        let deviceJson = {};
-        if (!fs.existsSync(deviceJsonFile)) {
-            console.log("Device file not exists - creating");
-            deviceJson = {
-                deviceId: uuidv4()
-            };
-            fs.writeFileSync(deviceJsonFile, JSON.stringify(deviceJson));
+    init(options=null) {
+        let deviceId
+        if(typeof options === "string") {
+            deviceId = options
+        } else {
+            if(options && options.deviceId) {
+                deviceId = options.deviceId
+            }
         }
-        deviceJson = require(deviceJsonFile);
-        let deviceId = deviceJson.deviceId;
+        if (deviceId) {
+            this.deviceId = deviceId;
+        } else {
+                let deviceJsonFile = process.cwd() + "/device.json";
+                let deviceJson = {};
+                if (!fs.existsSync(deviceJsonFile)) {
+                    console.log("Device file not exists - creating");
+                    deviceJson = {
+                        deviceId: uuidv4()
+                    };
+                    fs.writeFileSync(deviceJsonFile, JSON.stringify(deviceJson));
+                }
+                deviceJson = require(deviceJsonFile);
+                let deviceId = deviceJson.deviceId;
 
-        let hookFn = NodeClient.hooks && NodeClient.hooks.modifyDeviceId;
-        if(typeof hookFn === 'function') {
-            deviceId = hookFn(deviceId);
-        }
-        NodeClient.deviceId = deviceId;
-        console.debug(`Initialized node client for device ${deviceId}`)
+                let hookFn = NodeClient.hooks && NodeClient.hooks.modifyDeviceId;
+                if(typeof hookFn === 'function') {
+                    deviceId = hookFn(deviceId);
+                }
+                this.deviceId = deviceId;
+            }
+        console.debug(`Initialized node client for device ${this.deviceId}`)
     },
 
     connect(url= null, secret=null) {
         if(!url) {
             url = config.connect_url;
         }
-        if(!secret) {
-            secret = config.connect_secret;
-        }
-        let query = {
-            secret: secret,
-            deviceId: NodeClient.deviceId,
-            processId: process.pid,
-            modules: config.modules || [],
-            version: pjson.version
-        }
+        let query = getConnectionParams({secret: secret})
         this.socket = require('socket.io-client')(url, {
             query: query
         });
         console.debug(`Connecting to remote socket ${url}`)
+    },
+
+    onSocketEvent(socketEvent, fn) {
+        SocketUtil.socketEventHandlers[socketEvent]=fn
     },
 
     handle(Handler=null) {
@@ -150,125 +336,25 @@ const NodeClient = {
 
         let socket = this.socket;
 
-        socket.on("requestDeviceMethod", (method, params, ack) => {
-            //console.log(`Requested method ${method} params=${JSON.stringify(params)}`);
-            let fn = this.commonHandler[method];
-            if(!fn) {
-                fn = this.handler && this.handler[method];
-            }
-            if(!fn) {
-                fn = this.methods[method];
-            }
-            if(!fn) {
-                fn = global[method];
-            }
-            if(typeof fn !== 'function') {
-                console.log(`Method ${method} not found`);
-                if(typeof ack === 'function') {
-                    ack({error:{message:`Method ${method} not found`,status:'DEVICE_METHOD_NOT_FOUND',stack:Error().stack}});
-                }
-                return;
-            }
-            const isAsync = fn.constructor.name === "AsyncFunction";
-            if(isAsync) {
-                new Promise(async function(resolve, reject) {
-                    let res;
-                    try {
-                        if(typeof params === "object" && params.length>0) {
-                            res = await fn(...params);
-                        } else {
-                            res = await fn(params);
-                        }
-                    } catch(e) {
-                        res = {error:{message:e.message, stack:e.stack, code:'DEVICE_METHOD_ERROR'}};
-                    }
-                    if (typeof ack === 'function') {
-                        resolve(ack(res));
-                    } else  {
-                        resolve(res);
-                    }
-                });
-            } else {
-                let res;
-                try {
-                    if(typeof params === "object" && params.length>0) {
-                        res = fn(...params);
-                    } else {
-                        res = fn(params);
-                    }
-                } catch(e) {
-                    res = {error:{message:e.message, stack:e.stack, code:'DEVICE_METHOD_ERROR'}};
-                }
-                if(typeof ack === 'function') {
-                    ack(res);
-                }
-            }
+        SocketUtil.handleCommonSocketEvents(socket)
+
+        process.on('uncaughtException', function (e) {
+            console.log(e)
         });
 
-        ss(socket).on('requestDeviceStream',  (stream, data, ack) => {
+        socket.on("execNodeMethod", (method, params, ack) => {
+            console.log(`Requested method ${method} params=${JSON.stringify(params)}`);
             try {
-                console.log(`Received requestDeviceStream ${data.method}`);
-                let method = data.method;
-                let params = data.params;
-                let fn = this.commonHandler[method];
-                if(!fn) {
-                    fn = this.handler && this.handler[method];
-                }
-                if(!fn) {
-                    fn = this.methods[method];
-                }
-                if(!fn) {
-                    fn = global[method];
-                }
-                if(typeof fn !== 'function') {
-                    console.log(`Method ${method} not found`);
-                    ack();
-                    return;
-                }
-                ack(fn(stream, params, ack));
-            } catch(e) {
-                let res = {error:{message:e.message, stack:e.stack, code:'DEVICE_METHOD_ERROR'}};
-                ack(res);
+            onExecNodeMethod(method, params, ack)
+            } catch (e) {
+                ack({error: true, message: e.message, stack: e.stack})
             }
-
         });
 
-
-
-
-
-
-        this.socket.on('message1', function(msg, ack){
-            console.log(msg);
-            //check message
-            let nodeTo = msg.to;
-            if(nodeTo !== NodeClient.deviceId) {
-                console.error(`Received message not for this node`);
-                return;
-            }
-            let nodeFrom = msg.from;
-            if(!checkAllowedSender(nodeFrom)) {
-                console.error(`Not allowed sending from node ${nodeFrom}`);
-                if (typeof ack === 'function') {
-                    ack({error: true, message: `Not allowed sending from node ${nodeFrom}`});
-                }
-                return;
-            }
-            if(!checkAllowedMessage(msg.method)) {
-                console.error(`Not allowed message with name ${msg.method}`);
-                if (typeof ack === 'function') {
-                    ack({error: true, message: `Not allowed message with name ${msg.method}`});
-                }
-                return;
-            }
-            procesMessage(Handler, msg, ack);
+        ss(socket).on('execNodeStream',  (stream, data, ack) => {
+            onExecNodeStream(stream, data.method, data.params, ack)
         });
-        this.socket.on('disconnect', function(reason){
-            console.log("disconnected socket");
-        });
-        ss(this.socket).on('streamMessage1', function(stream, data) {
-            procesStreamMessage(Handler, stream, data);
-        });
+
     },
 
     loadModules() {
@@ -300,132 +386,77 @@ const NodeClient = {
 
     async asyncEmit(event, params) {
         return new Promise((resolve, reject) => {
-            if(!this.socket.connected) {
-                resolve({error:{message:'Remote server not connected',status:'MEDIATOR_NOT_CONNECTED',stack:Error().stack}});
-            } else {
-                this.socket.emit(event,params,(res) => {
-                    resolve(res);
-                })
-            }
+            this.emit(event, params, res => {
+                resolve(res);
+            })
         })
     },
 
-    emit(event, ...params){
-        let cb;
-        if(typeof params[params.length-1] === 'function') {
-            cb = params.pop();
-            if(!this.socket.connected) {
+    emit(event, params, cb){
+        if(!this.socket.connected) {
+            if(cb) {
                 cb({error:{message:'Remote server not connected',status:'MEDIATOR_NOT_CONNECTED',stack:Error().stack}});
-            } else {
-                let cbe = (res) => {
-                    cb(res);
-                };
-                params = [...params, cbe];
-                this.socket.emit(event,...params);
             }
         } else {
-            this.socket.emit(event,...params);
+            this.socket.emit(event,params, cb)
         }
     },
 
-    requestDeviceMethod(deviceId, method, ...params) {
-        let cb = params.pop();
-        let cbe = (res) => {
-            if(typeof cb === 'function') {
-                cb(res);
-            }
-        };
-        if(params.length===1) {
-            params = params[0];
-        }
-        this.emit("requestDeviceMethod",{from: global.deviceId, to: deviceId, method: method, params: params}, cbe);
+    execNodeMethod(deviceId, method, params, cb) {
+        this.emit("execNodeMethod",{from: this.deviceId, to: deviceId, method: method, params: params}, cb);
     },
 
-    async asyncRequestDeviceMethod(deviceId, method, params) {
-        let res =  await this.asyncEmit("requestDeviceMethod",{from: global.deviceId, to: deviceId, method: method, params: params});
-        return res;
+    async asyncExecNodeMethod(deviceId, method, params) {
+        return await this.asyncEmit("execNodeMethod", {
+            from: global.deviceId,
+            to: deviceId,
+            method: method,
+            params: params
+        });
     },
 
-
-
-
-
-
-    //----------------------------------------------------------------
-    sendRequest(message, callback) {
-        message = message || {};
-        if(!message.method) {
-            return;
-        }
-        if(!message.from) {
-            message.from = NodeClient.deviceId;
-        }
-        if(!message.payload) {
-            message.payload = {};
-        }
-        //console.log('Sending message', message);
-        this.emit("requestDeviceMethod", {to: message.to, from: message.from, method: message.method, params: message.payload},callback);
-
-        // this.socket.emit("message", message, callback ? function(ack){
-        //     callback(ack);
-        // } : null);
-    },
-
-    sendStreamRequest(stream, method, deviceId, params, ack) {
+    execNodeStream(stream, method, deviceId, params, ack) {
         let fccStream = ss.createStream({objectMode:true});
         fccStream.pipe(stream);
-        stream.on('end', function() {
-            fccStream.end()
+        stream.on('destroyed', function() {
+            console.log("stream:destroyed")
+            fccStream.destroy()
         });
-        stream.on('close', function() {
-            fccStream.end()
-        });
-        stream.on('unpipe', function() {
-            fccStream.end()
-        });
-        ss(this.socket).emit('requestDeviceStream', fccStream, {from: NodeClient.deviceId, to:deviceId, method:method, params: params }, (res)=>{
+        ss(this.socket).emit('execNodeStream', fccStream, {from: NodeClient.deviceId, to:deviceId, method:method, params: params }, (res)=>{
             ack(res);
         });
     },
 
-    storeData(name, property, value) {
-        NodeClient.sendRequest({method: 'storeData', payload:{name, property, value}})
+    storeData(params, cb) {
+        let name = params.name
+        let property = params.property
+        let value = params.value
+        NodeClient.execNodeMethod(null, 'storeData', {name, property, value}, cb)
     },
 
     readData(name, property, filter, cb) {
-        NodeClient.sendRequest({method:'readData', payload: {name, property, filter}}, cb)
+        NodeClient.execNodeMethod(null, 'readData', {name, property, filter}, cb)
     },
 
     execSQL(sql, params, cb) {
-        NodeClient.sendRequest({method: 'execSQL', payload: {sql, params}}, cb);
+        NodeClient.execNodeMethod(null, 'execSQL', {sql, params}, cb)
     },
 
-    registerDeviceMethod(method, fn) {
+    registerNodeMethod(method, fn) {
         this.methods[method]=fn
     },
 
-    registerDeviceStreamMethod(method, onStart, onEnd) {
+    registerNodeStream(method, onStart, onEnd) {
         let fn = (stream, params, ack) => {
-            let fnStream = new require('stream').Readable({
-                read() {},
-                objectMode: true
+            stream.on("destroyed", ()=>{
+                onEnd(stream)
             })
-            fnStream.pipe(stream)
-            if(!this.streamRegistry[method]) {
-                this.streamRegistry[method] = {}
-            }
-            this.streamRegistry[method][stream.id]=fnStream
-            stream.on('unpipe',()=>{
-                onEnd(fnStream)
-                delete this.streamRegistry[method][stream.id]
-                fnStream.destroy()
-            });
-            return onStart(fnStream, params)
+            onStart(stream, params, ack)
         }
         this.methods[method]=fn
     },
 
-    updateDeviceStreamMethod(method, fn) {
+    updateNodeStream(method, fn) {
         let streams = this.streamRegistry[method]
         for(let stream in streams) {
             fn(stream)
@@ -463,107 +494,8 @@ const NodeClient = {
 
     storeSocketData(key, value) {
         console.log(`Send storeSocketData ${key}=${value}`)
-        this.sendRequest({method: 'storeSocketData', payload: { key, value, from: NodeClient.deviceId }})
+        this.execNodeMethod(null, 'storeSocketData', { key, value, from: NodeClient.deviceId })
     },
 
-    commonHandler: {
-        async execCmd(cmd) {
-
-            let hookFn = NodeClient.hooks && NodeClient.hooks.beforeExecCmd;
-            if(typeof hookFn === 'function') {
-                cmd = hookFn(cmd);
-            }
-
-            console.log(`Executin shell command: ${cmd}`);
-            return new Promise(function(resolve, reject) {
-                exec(cmd, (err, stdout, stderr) => {
-                    if (err) {
-                        // node couldn't execute the command
-                        console.log(err);
-                        //reject(err);
-                    }
-                    resolve({
-                        stdout:stdout,
-                        stderr:stderr
-                    });
-                });
-            });
-        },
-        restart() {
-            setTimeout(function () {
-                process.on("exit", function () {
-                    require("child_process").spawn(process.argv.shift(), process.argv, {
-                        cwd: process.cwd(),
-                        detached : true,
-                        stdio: "inherit"
-                    });
-                });
-                process.exit();
-            }, 1000);
-        },
-        stop() {
-            process.exit();
-        },
-        getDeviceVersion() {
-            return pjson.version;
-        },
-        async getLatestVersion() {
-            return await new Promise(resolve => {
-                let to = config.modules_config.system.version_check.remote_device;
-                NodeClient.sendRequest({to: to, method: 'getDeviceLatestVersion', payload: config.modules_config.system.version_check},(data)=>{
-                    resolve(data);
-                })
-            });
-        },
-        async upgrade() {
-            return await new Promise(resolve => {
-                let to = config.modules_config.system.version_check.remote_device;
-                let stream = ss.createStream({objectMode:true});
-                ss(NodeClient.socket).emit('streamMessage',stream,{from: NodeClient.deviceId, to: to, method: 'getModuleSource', payload: config.modules_config.system.version_check},(res)=>{
-                    console.log(res);
-                });
-                stream.on('data',(data)=>{
-                   console.log(data);
-                });
-                stream.pipe(fs.createWriteStream('/tmp/stream.txt'));
-            });
-        },
-        readFile(file) {
-            let content = fs.readFileSync(file,'utf8');
-            return content;
-        },
-        writeFile(file, content) {
-            let res = fs.writeFileSync(file, content);
-            return res;
-        },
-        appendFile(file, line) {
-            let res = fs.appendFileSync(file, line);
-            return res;
-        },
-        fileExists(file) {
-            let res = fs.existsSync(file);
-            return res;
-        },
-        tailFile(stream, file, ack) {
-            const mytail = new Tail(file);
-            mytail.on('line', (line) => {
-                stream.write(line);
-            });
-            stream.on('end',()=>{
-                mytail.stop();
-            });
-            stream.on('unpipe',()=>{
-                mytail.stop();
-            });
-            // NodeClientUtil.debugStreamEvents(stream);
-            mytail.start();
-            if(ack) {
-                ack('OK');
-            }
-        },
-        getClientModules() {
-            return NodeClient.modules
-        }
-    }
 };
 module.exports = NodeClient;

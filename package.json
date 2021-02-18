@@ -1,23 +1,33 @@
 {
-  "name": "nclient-lib",
-  "version": "1.0.13",
-  "description": "Basic client library for communicating on cloud",
-  "main": "index.js",
-  "scripts": {
-    "build": "rm -f nclient-lib-*.tgz && npm pack && cp nclient-lib-*.tgz ../ncloud/public/lib/nclient-lib.tgz"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "files": [
-    "index.js",
-    "NodeClient.js",
-    "NodeClientUtil.js"
-  ],
-  "dependencies": {
-    "socket.io-client": "^2.3.0",
-    "socket.io-stream": "^0.9.1",
-    "tail-file": "^1.4.13",
-    "uuid": "^3.3.3"
-  }
+    "name": "nclient-lib",
+    "version": "1.0.45",
+    "id": "nclient",
+    "title": "NodeClient",
+    "description": "Basic client library for communicating on cloud",
+    "main": "index.js",
+    "scripts": {
+        "increase_version": "node increase_version.js",
+        "build": "rm -f nclient-lib*.tgz && npm pack && cp nclient-lib-*.tgz nclient-lib.tgz",
+        "publish": "curl -F \"file=@./nclient-lib.tgz\" http://159.69.2.203:3030/upload"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC",
+    "files": [
+        "index.js",
+        "NodeClient.js",
+        "NodeClientUtil.js",
+        "SocketUtil.js",
+        "CommonHandler.js",
+        "SecurityHandler.js"
+    ],
+    "dependencies": {
+        "socket.io-client": "^2.3.0",
+        "socket.io-stream": "^0.9.1",
+        "tail-file": "^1.4.13",
+        "uuid": "^3.3.3",
+        "mqtt": "^4.2.4"
+    },
+    "devDependencies": {},
+    "ncloud-type": "lib"
 }
