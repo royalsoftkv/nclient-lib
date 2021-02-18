@@ -1,2 +1,6 @@
 /node_modules/
 /nclient-lib-1.0.10.tgz
+/.idea/
+/nclient-lib.tgz
+/nclient-lib-1.0.45.tgz
+/package-lock.json
