@@ -7,6 +7,7 @@ const fs = require("fs");
 const path = require("path");
 const uuidv4 = require('uuid/v4')
 const Tail = require('tail-file')
+const crypt = require("./crypt")
 
 let configFilePath = process.cwd()+'/config.json';
 let config = {
@@ -69,10 +70,7 @@ let getConnectionParams = (params = {}) => {
 }
 
 let findFunction = (method) => {
-    let fn = NodeClient.commonHandler[method];
-    if(!fn) {
-        fn = NodeClient.handler && NodeClient.handler[method];
-    }
+    let fn = NodeClient.remoteHandler[method];
     if(!fn) {
         fn = NodeClient.methods[method];
     }
@@ -144,29 +142,8 @@ const NodeClient = {
     mqtt: null,
     onConnect: null,
     socketEventHandlers: {},
-    commonHandler: {
-        async execCmd(cmd) {
-
-            let hookFn = NodeClient.hooks && NodeClient.hooks.beforeExecCmd;
-            if(typeof hookFn === 'function') {
-                cmd = hookFn(cmd);
-            }
-
-            //console.log(`Executing shell command: ${cmd}`);
-            return new Promise(function(resolve, reject) {
-                exec(cmd, (err, stdout, stderr) => {
-                    if (err) {
-                        // node couldn't execute the command
-                        console.log(JSON.stringify(err));
-                        //reject(err);
-                    }
-                    resolve({
-                        stdout:stdout,
-                        stderr:stderr
-                    });
-                });
-            });
-        },
+    keys: {},
+    remoteHandler: {
         restart() {
             setTimeout(function () {
                 process.on("exit", function () {
@@ -207,6 +184,42 @@ const NodeClient = {
                 stream.pipe(fs.createWriteStream('/tmp/stream.txt'));
             });
         },
+        getClientModules(params, cb) {
+            cb(NodeClient.modules)
+        },
+        async updateNode() {
+            let res = await NodeClient.commonHandler.execCmd('npm update')
+            if(res.stderr) {
+                let res = await NodeClient.commonHandler.execCmd('./node ./npm update')
+                return res.stdout
+            } else {
+                return res.stdout
+            }
+        }
+    },
+    commonHandler: {
+        async execCmd(cmd) {
+
+            let hookFn = NodeClient.hooks && NodeClient.hooks.beforeExecCmd;
+            if(typeof hookFn === 'function') {
+                cmd = hookFn(cmd);
+            }
+
+            //console.log(`Executing shell command: ${cmd}`);
+            return new Promise(function(resolve, reject) {
+                exec(cmd, (err, stdout, stderr) => {
+                    if (err) {
+                        // node couldn't execute the command
+                        console.log(JSON.stringify(err));
+                        //reject(err);
+                    }
+                    resolve({
+                        stdout:stdout,
+                        stderr:stderr
+                    });
+                });
+            });
+        },
         readFile(params, cb) {
             file=params.file
             let content = fs.readFileSync(file,'utf8');
@@ -228,32 +241,12 @@ const NodeClient = {
             cb(res)
         },
         tailFile(stream, file, ack) {
-
             let cmd = spawn('tail', ['-f', file]);
             cmd.stdout.pipe(stream);
-
             stream.on("destroyed", ()=>{
                 cmd.kill("SIGTERM")
             })
-
             ack(file)
-            // const mytail = new Tail(file);
-            // mytail.on('line', (line) => {
-            //     stream.write(line);
-            // });
-            // stream.on('end',()=>{
-            //     mytail.stop();
-            // });
-            // stream.on('unpipe',()=>{
-            //     mytail.stop();
-            // });
-            // mytail.start();
-            // if(ack) {
-            //     ack('OK');
-            // }
-        },
-        getClientModules(params, cb) {
-            cb(NodeClient.modules)
         },
         readConfig(params, cb) {
             let  {module, file} = params
@@ -263,15 +256,6 @@ const NodeClient = {
             let  {module, file, content} = params
             cb(NodeClient.storeConfig(module, file, content))
         },
-        async updateNode() {
-            let res = await NodeClient.commonHandler.execCmd('npm update')
-            if(res.stderr) {
-                let res = await NodeClient.commonHandler.execCmd('./node ./npm update')
-                return res.stdout
-            } else {
-                return res.stdout
-            }
-        }
     },
 
     start() {
@@ -311,6 +295,7 @@ const NodeClient = {
                 }
                 this.deviceId = deviceId;
             }
+        this.keys = crypt.generateKeys(this.deviceId)
         console.debug(`Initialized node client for device ${this.deviceId}`)
     },
 
@@ -319,6 +304,7 @@ const NodeClient = {
             url = config.connect_url;
         }
         let query = getConnectionParams({secret: secret})
+        query.pubKey = this.keys.publicKey
         this.socket = require('socket.io-client')(url, {
             query: query
         });
@@ -329,10 +315,7 @@ const NodeClient = {
         SocketUtil.socketEventHandlers[socketEvent]=fn
     },
 
-    handle(Handler=null) {
-        if(!this.handler) {
-            this.handler = Handler;
-        }
+    handle() {
 
         let socket = this.socket;
 
@@ -342,14 +325,49 @@ const NodeClient = {
             console.log(e)
         });
 
-        socket.on("execNodeMethod", (method, params, ack) => {
-            console.log(`Requested method ${method} params=${JSON.stringify(params)}`);
-            try {
-            onExecNodeMethod(method, params, ack)
-            } catch (e) {
-                ack({error: true, message: e.message, stack: e.stack})
+        socket.on("execNodeMethod", (payload, ack) => {
+            let method, params
+            if(typeof payload !== 'object') {
+                try {
+                    let payloadDecypted = crypt.decrypt(payload, this.keys.privateKey, NodeClient.deviceId)
+                    payload = JSON.parse(payloadDecypted)
+                    method = payload.method
+                    params = payload.params
+                } catch (e) {
+                    ack({error: true, message: e.message, stack: e.stack})
+                }
+            } else {
+                if(config.legacy && config.legacy.enabled) {
+                    if(payload.legacy) {
+                        method = payload.method
+                        params = payload.params
+                        if(config.legacy.methods && config.legacy.methods.includes(method)) {
+                            console.log("allowed legacy call ", method)
+                        } else {
+                            method = null
+                            console.error("NO LEGACY CALL FOR METHOD ", method)
+                            ack({error: true, message: "NOT ALLOWED METHOD FOR LEGACY CALL"})
+                        }
+                    } else {
+                        console.error("NO LEGACY")
+                        ack({error: true, message: "NOT MARKED LEGACY CALL"})
+                    }
+                } else {
+                    console.error("NO LEGACY CALLS")
+                    ack({error: true, message: "NOT ALLOWED NON LEGACY CALLS"})
+                }
+
+            }
+            if(method) {
+                onExecNodeMethod(method, params, ack)
             }
         });
+
+        socket.on("ncloudPubKey", (ncloudPubKey, ack)=>{
+            this.ncloudPubKey = ncloudPubKey
+            SocketUtil.handleSocketEvent("client_connected")
+            ack()
+        })
 
         ss(socket).on('execNodeStream',  (stream, data, ack) => {
             onExecNodeStream(stream, data.method, data.params, ack)
@@ -392,13 +410,14 @@ const NodeClient = {
         })
     },
 
-    emit(event, params, cb){
+    emit(event, payload, cb){
         if(!this.socket.connected) {
             if(cb) {
                 cb({error:{message:'Remote server not connected',status:'MEDIATOR_NOT_CONNECTED',stack:Error().stack}});
             }
         } else {
-            this.socket.emit(event,params, cb)
+            let encrypted = crypt.encrypt(JSON.stringify(payload), NodeClient.ncloudPubKey)
+            this.socket.emit(event, encrypted, cb)
         }
     },
 

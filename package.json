@@ -1,6 +1,6 @@
 {
     "name": "nclient-lib",
-    "version": "1.0.45",
+    "version": "1.0.51",
     "id": "nclient",
     "title": "NodeClient",
     "description": "Basic client library for communicating on cloud",
@@ -19,7 +19,8 @@
         "NodeClientUtil.js",
         "SocketUtil.js",
         "CommonHandler.js",
-        "SecurityHandler.js"
+        "SecurityHandler.js",
+        "crypt.js"
     ],
     "dependencies": {
         "socket.io-client": "^2.3.0",
