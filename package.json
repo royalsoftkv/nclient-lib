@@ -1,6 +1,6 @@
 {
     "name": "nclient-lib",
-    "version": "1.0.51",
+    "version": "1.0.58",
     "id": "nclient",
     "title": "NodeClient",
     "description": "Basic client library for communicating on cloud",
@@ -27,7 +27,8 @@
         "socket.io-stream": "^0.9.1",
         "tail-file": "^1.4.13",
         "uuid": "^3.3.3",
-        "mqtt": "^4.2.4"
+        "mqtt": "^4.2.4",
+        "jsonwebtoken": "^8.5.1"
     },
     "devDependencies": {},
     "ncloud-type": "lib"

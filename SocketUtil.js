@@ -9,6 +9,11 @@ module.exports = {
         })
 
         socket.on("disconnect", (reason)=>{
+            if(reason === 'io server disconnect') {
+                setTimeout(()=>{
+                    socket.connect();
+                }, 5000)
+            }
             this.handleSocketEvent("disconnect", reason)
         })
 

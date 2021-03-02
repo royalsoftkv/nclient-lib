@@ -8,6 +8,7 @@ const path = require("path");
 const uuidv4 = require('uuid/v4')
 const Tail = require('tail-file')
 const crypt = require("./crypt")
+const jwt = require('jsonwebtoken')
 
 let configFilePath = process.cwd()+'/config.json';
 let config = {
@@ -81,7 +82,7 @@ let findFunction = (method) => {
 }
 
 let onExecNodeMethod = (method, params, ack) => {
-    console.log(`execNodeMethod method=${method} params=${params}`)
+    //console.log(`execNodeMethod method=${method} params=${params}`)
     let fn = findFunction(method)
     if(typeof fn !== 'function') {
         console.log(`Method ${method} not found`);
@@ -95,7 +96,7 @@ let onExecNodeMethod = (method, params, ack) => {
         new Promise(async function (resolve, reject) {
             let res;
             try {
-                console.log('Calling function: res = await fn(params);')
+                //console.log('Calling function: res = await fn(params);')
                 res = await fn(params);
             } catch (e) {
                 res = {error: {message: e.message, stack: e.stack, code: 'DEVICE_METHOD_ERROR'}};
@@ -111,11 +112,11 @@ let onExecNodeMethod = (method, params, ack) => {
         }).then();
     } else {
         if(typeof ack === 'function') {
-            console.log('Calling function: fn.apply(this, [params, ack])')
+            //console.log('Calling function: fn.apply(this, [params, ack])')
             fn.apply(this, [params, ack])
         } else {
             try {
-                console.log('Calling function: res = fn(params);')
+                //console.log('Calling function: res = fn(params);')
                 fn(params);
             } catch(e) {
                 console.log({error:{message:e.message, stack:e.stack, code:'DEVICE_METHOD_ERROR'}})
@@ -128,6 +129,28 @@ let nclientVersion = () => {
     let pjson = require('./package.json')
     return pjson.version
 }
+
+let checkToken = (socket, token, ack) => {
+    if(!token) {
+        if (typeof ack === "function") {
+            ack({error: {message: `Missing jwt token in payload`, status: 'MISSING_TOKEN'}});
+            return false
+        }
+    }
+    try {
+        let decoded = jwt.verify(token, NodeClient.publicKey);
+        //console.log(decoded)
+    } catch (e) {
+        if(e.message === "jwt expired") {
+            ack({error: {message: `Error decoding token`, status: 'TOKEN_EXPIRED'}});
+        } else {
+            ack({error: {message: `Error decoding token`, status: 'TOKEN_ERROR'}});
+        }
+        return false
+    }
+    return true
+}
+
 
 
 const NodeClient = {
@@ -143,6 +166,7 @@ const NodeClient = {
     onConnect: null,
     socketEventHandlers: {},
     keys: {},
+    token: null,
     remoteHandler: {
         restart() {
             setTimeout(function () {
@@ -195,7 +219,24 @@ const NodeClient = {
             } else {
                 return res.stdout
             }
-        }
+        },
+        readNodeConfigFile(params, cb) {
+            let file = path.join(process.cwd(),'config.json')
+            NodeClient.commonHandler.readFile(file,cb)
+        },
+        writeNodeConfigFile(params, cb) {
+            let file = path.join(process.cwd(),'config.json')
+            let content = params.content
+            NodeClient.commonHandler.writeFile(file, content, cb)
+        },
+        readConfig(params, cb) {
+            let  {module, file} = params
+            cb(NodeClient.readConfig(module, file))
+        },
+        storeConfig(params, cb) {
+            let  {module, file, content} = params
+            cb(NodeClient.storeConfig(module, file, content))
+        },
     },
     commonHandler: {
         async execCmd(cmd) {
@@ -220,14 +261,11 @@ const NodeClient = {
                 });
             });
         },
-        readFile(params, cb) {
-            file=params.file
+        readFile(file, cb) {
             let content = fs.readFileSync(file,'utf8');
             cb(content)
         },
-        writeFile(params, cb) {
-            let file = params.file
-            let content = params.content
+        writeFile(file, content, cb) {
             let res = fs.writeFileSync(file, content);
             cb(res)
         },
@@ -247,14 +285,6 @@ const NodeClient = {
                 cmd.kill("SIGTERM")
             })
             ack(file)
-        },
-        readConfig(params, cb) {
-            let  {module, file} = params
-            cb(NodeClient.readConfig(module, file))
-        },
-        storeConfig(params, cb) {
-            let  {module, file, content} = params
-            cb(NodeClient.storeConfig(module, file, content))
         },
     },
 
@@ -327,49 +357,72 @@ const NodeClient = {
 
         socket.on("execNodeMethod", (payload, ack) => {
             let method, params
-            if(typeof payload !== 'object') {
-                try {
-                    let payloadDecypted = crypt.decrypt(payload, this.keys.privateKey, NodeClient.deviceId)
-                    payload = JSON.parse(payloadDecypted)
-                    method = payload.method
-                    params = payload.params
-                } catch (e) {
-                    ack({error: true, message: e.message, stack: e.stack})
+
+            let token = payload.token
+
+            if(!checkToken(socket, token, ack)) {
+                return
                 }
-            } else {
-                if(config.legacy && config.legacy.enabled) {
-                    if(payload.legacy) {
+            //
+            // try {
+            //     let decoded = jwt.verify(token, NodeClient.publicKey);
+            //     console.log(decoded)
+            // } catch (e) {
+            //
+            // }
+
+            // if(typeof payload !== 'object') {
+            //     try {
+            //         let payloadDecypted = crypt.decrypt(payload, this.keys.privateKey, NodeClient.deviceId)
+            //         payload = JSON.parse(payloadDecypted)
+            //         method = payload.method
+            //         params = payload.params
+            //     } catch (e) {
+            //         ack({error: true, message: e.message, stack: e.stack})
+            //     }
+            // } else {
+            //     if(config.legacy && config.legacy.enabled) {
+            //         if(payload.legacy) {
+            //             method = payload.method
+            //             params = payload.params
+            //             if(config.legacy.methods && config.legacy.methods.includes(method)) {
+            //                 console.log("allowed legacy call ", method)
+            //             } else {
+            //                 method = null
+            //                 console.error("NO LEGACY CALL FOR METHOD ", method)
+            //                 ack({error: true, message: "NOT ALLOWED METHOD FOR LEGACY CALL"})
+            //             }
+            //         } else {
+            //             console.error("NO LEGACY")
+            //             ack({error: true, message: "NOT MARKED LEGACY CALL"})
+            //         }
+            //     } else {
+            //         console.error("NO LEGACY CALLS")
+            //         ack({error: true, message: "NOT ALLOWED NON LEGACY CALLS"})
+            //     }
+            //
+            // }
+
                         method = payload.method
                         params = payload.params
-                        if(config.legacy.methods && config.legacy.methods.includes(method)) {
-                            console.log("allowed legacy call ", method)
-                        } else {
-                            method = null
-                            console.error("NO LEGACY CALL FOR METHOD ", method)
-                            ack({error: true, message: "NOT ALLOWED METHOD FOR LEGACY CALL"})
-                        }
-                    } else {
-                        console.error("NO LEGACY")
-                        ack({error: true, message: "NOT MARKED LEGACY CALL"})
-                    }
-                } else {
-                    console.error("NO LEGACY CALLS")
-                    ack({error: true, message: "NOT ALLOWED NON LEGACY CALLS"})
-                }
 
-            }
             if(method) {
                 onExecNodeMethod(method, params, ack)
             }
         });
 
-        socket.on("ncloudPubKey", (ncloudPubKey, ack)=>{
-            this.ncloudPubKey = ncloudPubKey
-            SocketUtil.handleSocketEvent("client_connected")
-            ack()
+        socket.on("token", (data, ack)=>{
+            console.log(`Received token ${data.token}`)
+            this.token = data.token
+            this.publicKey = data.publicKey
+            SocketUtil.handleSocketEvent("client_connected", ack)
         })
 
         ss(socket).on('execNodeStream',  (stream, data, ack) => {
+            let token = data.token
+            if(!checkToken(socket, token, ack)) {
+                return
+            }
             onExecNodeStream(stream, data.method, data.params, ack)
         });
 
@@ -416,8 +469,8 @@ const NodeClient = {
                 cb({error:{message:'Remote server not connected',status:'MEDIATOR_NOT_CONNECTED',stack:Error().stack}});
             }
         } else {
-            let encrypted = crypt.encrypt(JSON.stringify(payload), NodeClient.ncloudPubKey)
-            this.socket.emit(event, encrypted, cb)
+            payload.token = NodeClient.token
+            this.socket.emit(event, payload, cb)
         }
     },
 
@@ -441,7 +494,19 @@ const NodeClient = {
             console.log("stream:destroyed")
             fccStream.destroy()
         });
-        ss(this.socket).emit('execNodeStream', fccStream, {from: NodeClient.deviceId, to:deviceId, method:method, params: params }, (res)=>{
+        ss(this.socket).emit('execNodeStream', fccStream,
+            {from: NodeClient.deviceId, to:deviceId, method:method, params: params, token: NodeClient.token }, (res)=>{
+            ack(res);
+        });
+    },
+
+    callNodeStream(method, deviceId, params, ack, ondata) {
+        let stream = ss.createStream({objectMode:true});
+        stream.on("data", data =>{
+            ondata(data)
+        })
+        ss(this.socket).emit('execNodeStream', stream, {
+            from: NodeClient.deviceId, to:deviceId, method:method, params: params, token: NodeClient.token }, (res)=>{
             ack(res);
         });
     },
