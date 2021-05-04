@@ -19,7 +19,6 @@ if(fs.existsSync(configFilePath)) {
 }
 
 const ss = require('socket.io-stream');
-const pjson = require(process.cwd() + '/package.json');
 const SocketUtil = require("./SocketUtil")
 
 /** override destroy method to stop stream propagation **/
@@ -113,7 +112,12 @@ let onExecNodeMethod = (method, params, ack) => {
     } else {
         if(typeof ack === 'function') {
             //console.log('Calling function: fn.apply(this, [params, ack])')
+            try {
             fn.apply(this, [params, ack])
+            } catch(e) {
+                let err = {error: {message: e.message, status: 'FUNCTION_ERROR'}}
+                ack(err)
+            }
         } else {
             try {
                 //console.log('Calling function: res = fn(params);')
@@ -184,6 +188,7 @@ const NodeClient = {
             process.exit();
         },
         getDeviceVersion(params, cb) {
+            const pjson = require(process.cwd() + '/package.json');
             cb(pjson.version)
         },
         async getLatestVersion() {
@@ -284,7 +289,9 @@ const NodeClient = {
             stream.on("destroyed", ()=>{
                 cmd.kill("SIGTERM")
             })
-            ack(file)
+            if(ack){
+                ack(file)
+            }
         },
     },
 
