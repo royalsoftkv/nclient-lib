@@ -5,11 +5,6 @@
     "title": "NodeClient",
     "description": "Basic client library for communicating on cloud",
     "main": "index.js",
-    "scripts": {
-        "increase_version": "node increase_version.js",
-        "build": "rm -f nclient-lib*.tgz && npm pack && cp nclient-lib-*.tgz nclient-lib.tgz",
-        "publish": "curl -F \"file=@./nclient-lib.tgz\" http://159.69.2.203:3030/upload"
-    },
     "keywords": [],
     "author": "",
     "license": "ISC",
