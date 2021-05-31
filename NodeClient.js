@@ -56,7 +56,7 @@ let onExecNodeStream = (stream, method, params, ack) => {
 }
 
 let getConnectionParams = (params = {}) => {
-    let secret
+    let secret = params.secret
     if(!params.secret) {
         secret = config.connect_secret;
     }
@@ -155,7 +155,11 @@ let checkToken = (socket, token, ack) => {
     return true
 }
 
+let timeOffset = 0
 
+let getTime = () => {
+    return Date.now() + timeOffset
+}
 
 const NodeClient = {
 
@@ -242,6 +246,21 @@ const NodeClient = {
             let  {module, file, content} = params
             cb(NodeClient.storeConfig(module, file, content))
         },
+        timeSync(params, cb) {
+            let t2 = getTime()
+            let res = params
+            res.t2 = t2
+            let t3 = getTime()
+            res.t3 = t3
+            cb(res)
+        },
+        getTimeData(params, cb) {
+            cb( {
+                time: Date.now(),
+                timeOffset: timeOffset,
+                networkTime: Date.now()+timeOffset
+            })
+        }
     },
     commonHandler: {
         async execCmd(cmd) {
@@ -432,6 +451,32 @@ const NodeClient = {
             }
             onExecNodeStream(stream, data.method, data.params, ack)
         });
+
+        setInterval(()=>{
+            console.log(`Time sync`)
+            NodeClient.execNodeMethod(null, "initList", null, res=>{
+                let clients = res.clients
+                for(let i in clients) {
+                    let client = clients[i].deviceId
+                    let t1 = getTime()
+                    NodeClient.execNodeMethod(client, "timeSync", {t1}, res => {
+                        if(!res.error) {
+                            let t4 = getTime()
+                            res.t4 = t4
+                            let duration = t4 - t1
+                            res.duration = duration
+                            let off = ((res.t4 - res.t1) - (res.t3 - res.t2)) /2
+                            res.off = off
+                            let delta = (res.t3 + off) - t4
+                            res.delta = delta
+                            timeOffset = timeOffset + delta
+                            res.clientTime =  getTime()
+                            console.log(res)
+                        }
+                    })
+                }
+            })
+        }, 30000)
 
     },
 
