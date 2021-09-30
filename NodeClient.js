@@ -9,6 +9,8 @@ const uuidv4 = require('uuid/v4')
 const Tail = require('tail-file')
 const crypt = require("./crypt")
 const jwt = require('jsonwebtoken')
+const uuid = require('uuid')
+const md5File = require('md5-file')
 
 let configFilePath = process.cwd()+'/config.json';
 let config = {
@@ -19,6 +21,7 @@ if(fs.existsSync(configFilePath)) {
 }
 
 const ss = require('socket.io-stream');
+const pjson = require(process.cwd() + '/package.json');
 const SocketUtil = require("./SocketUtil")
 
 /** override destroy method to stop stream propagation **/
@@ -57,7 +60,7 @@ let onExecNodeStream = (stream, method, params, ack) => {
 
 let getConnectionParams = (params = {}) => {
     let secret = params.secret
-    if(!params.secret) {
+    if(!secret) {
         secret = config.connect_secret;
     }
     return {
@@ -65,8 +68,26 @@ let getConnectionParams = (params = {}) => {
         deviceId: NodeClient.deviceId,
         processId: process.pid,
         modules: config.modules || [],
-        version: nclientVersion()
+        version: nclientVersion(),
+        token: getToken(secret)
     }
+    }
+
+let getToken = (secret) => {
+    let privateKey = fs.readFileSync('privkey.pem');
+    let payload = {
+        sub: "ncloud",
+        upn: "ncloud",
+        iss:'ncloud-token',
+        aud:'jwt-audience',
+        groups: [],
+        companyid: "ncloud",
+        jti: uuid.v4(),
+        iat: Date.now(),
+        exp: Date.now() + 60*60*24
+    }
+    let token = jwt.sign(payload, {key: privateKey, passphrase: secret} , { algorithm: 'RS256'})
+    return token
 }
 
 let findFunction = (method) => {
@@ -113,7 +134,7 @@ let onExecNodeMethod = (method, params, ack) => {
         if(typeof ack === 'function') {
             //console.log('Calling function: fn.apply(this, [params, ack])')
             try {
-            fn.apply(this, [params, ack])
+                fn.apply(this, [params, ack])
             } catch(e) {
                 let err = {error: {message: e.message, status: 'FUNCTION_ERROR'}}
                 ack(err)
@@ -155,12 +176,6 @@ let checkToken = (socket, token, ack) => {
     return true
 }
 
-let timeOffset = 0
-
-let getTime = () => {
-    return Date.now() + timeOffset
-}
-
 const NodeClient = {
 
     SOCKET_SECRET: 'netsock',
@@ -175,6 +190,9 @@ const NodeClient = {
     socketEventHandlers: {},
     keys: {},
     token: null,
+    security: {
+        allowSendFiles: []
+    },
     remoteHandler: {
         restart() {
             setTimeout(function () {
@@ -246,20 +264,63 @@ const NodeClient = {
             let  {module, file, content} = params
             cb(NodeClient.storeConfig(module, file, content))
         },
-        timeSync(params, cb) {
-            let t2 = getTime()
-            let res = params
-            res.t2 = t2
-            let t3 = getTime()
-            res.t3 = t3
-            cb(res)
+        getSendFiles(params, cb) {
+            cb(NodeClient.security.allowSendFiles)
         },
-        getTimeData(params, cb) {
-            cb( {
-                time: Date.now(),
-                timeOffset: timeOffset,
-                networkTime: Date.now()+timeOffset
+        sendFile(stream, params, ack) {
+            let file = params.file
+            //check security
+            let allow = false
+            for(let i=0; i< NodeClient.security.allowSendFiles.length; i++) {
+                let row = NodeClient.security.allowSendFiles[i]
+                if(new RegExp(row).test(file)) {
+                    allow = true
+                    break
+                }
+            }
+            if(!allow) {
+                ack({error: true, message: 'Not allowed access to file: '+file})
+                stream.end()
+            }
+
+            let stats = fs.statSync(file)
+            const hash = md5File.sync(file)
+            let readStream = fs.createReadStream(params.file)
+            readStream.pipe(stream)
+            readStream.on("end", ()=>{
+                console.log("stream end")
+                stream.end()
             })
+            console.log(`Received send file`, params)
+            ack({file, size: stats.size, hash})
+        },
+        receiveFile(params, ack) {
+            try {
+                let target = params.target
+                let local = params.local
+                let remote = params.remote
+                let writeStream = fs.createWriteStream(local)
+                let fileInfo
+                NodeClient.execNodeStream(writeStream, "sendFile", target, {file: remote}, res=> {
+                    if(res.error) {
+                        ack(res)
+                    } else {
+                        fileInfo = res
+                    }
+                })
+                writeStream.on("close", res => {
+                    console.log("received file",fileInfo)
+                    let stats = fs.statSync(local)
+                    const hash = md5File.sync(local)
+                    if(fileInfo && hash && fileInfo.size === stats.size && fileInfo.hash === hash) {
+                        ack({size: fileInfo.size})
+                    } else {
+                        ack(false)
+                    }
+                })
+            } catch (e) {
+                ack({error: true, message: e.message})
+            }
         }
     },
     commonHandler: {
@@ -353,6 +414,9 @@ const NodeClient = {
             }
         this.keys = crypt.generateKeys(this.deviceId)
         console.debug(`Initialized node client for device ${this.deviceId}`)
+        if(config.allowSendFiles) {
+            NodeClient.security.allowSendFiles.push(...config.allowSendFiles)
+        }
     },
 
     connect(url= null, secret=null) {
@@ -451,32 +515,6 @@ const NodeClient = {
             }
             onExecNodeStream(stream, data.method, data.params, ack)
         });
-
-        setInterval(()=>{
-            console.log(`Time sync`)
-            NodeClient.execNodeMethod(null, "initList", null, res=>{
-                let clients = res.clients
-                for(let i in clients) {
-                    let client = clients[i].deviceId
-                    let t1 = getTime()
-                    NodeClient.execNodeMethod(client, "timeSync", {t1}, res => {
-                        if(!res.error) {
-                            let t4 = getTime()
-                            res.t4 = t4
-                            let duration = t4 - t1
-                            res.duration = duration
-                            let off = ((res.t4 - res.t1) - (res.t3 - res.t2)) /2
-                            res.off = off
-                            let delta = (res.t3 + off) - t4
-                            res.delta = delta
-                            timeOffset = timeOffset + delta
-                            res.clientTime =  getTime()
-                            console.log(res)
-                        }
-                    })
-                }
-            })
-        }, 30000)
 
     },
 
@@ -631,7 +669,10 @@ const NodeClient = {
     storeSocketData(key, value) {
         console.log(`Send storeSocketData ${key}=${value}`)
         this.execNodeMethod(null, 'storeSocketData', { key, value, from: NodeClient.deviceId })
-    },
+        }
+
+
+
 
 };
 module.exports = NodeClient;
