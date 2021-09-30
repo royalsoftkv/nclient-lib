@@ -5,3 +5,5 @@
 /nclient-lib-1.0.45.tgz
 /package-lock.json
 /nclient-lib-1.0.61.tgz
+/build.sh
+/increase_version.js
